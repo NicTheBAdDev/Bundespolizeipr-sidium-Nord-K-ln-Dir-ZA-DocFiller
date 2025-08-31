@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <title>DocFiller</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { --bg:#f8fafc; --card:#fff; --border:#e5e7eb; --ink:#111827; --muted:#6b7280; }
+    * { box-sizing: border-box; }
+    html, body { margin:0; background:var(--bg); color:var(--ink);
+      font:14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial,sans-serif;}
+    .container { max-width: 880px; margin: 32px auto; padding: 0 16px; }
+    .card { background:var(--card); border:1px solid var(--border); border-radius:16px;
+      box-shadow:0 4px 16px rgba(0,0,0,.06); padding:24px; }
+    header { font-weight:700; margin-bottom:12px; }
+    h1 { margin:0 0 16px; font-size:22px; }
+    label { display:block; font-weight:600; margin:14px 0 6px; }
+    input, select { width:100%; padding:10px 12px; border:1px solid #d1d5db; border-radius:10px; font-size:14px; }
+    button { margin-top:16px; padding:10px 14px; border-radius:10px; border:1px solid var(--ink);
+      background:var(--ink); color:#fff; font-weight:600; cursor:pointer; }
+    button[disabled]{ opacity:.6; cursor:not-allowed; }
+    .grid-two { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+    @media (max-width:720px){ .grid-two { grid-template-columns:1fr; } }
+    .help { color:var(--muted); font-size:12px; margin-top:8px; }
+    .error { color:#b91c1c; white-space:pre-wrap; margin-top:12px; }
+    .success { color:#065f46; margin-top:16px; }
+    .links a { display:inline-block; margin-right:12px; }
+    .spinner { display:inline-block; width:16px; height:16px; border:2px solid #d1d5db;
+      border-top-color:var(--ink); border-radius:50%; animation:spin .9s linear infinite; vertical-align:middle; margin-left:8px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="card">
+      <header>DocFiller</header>
+      <h1>Dokument erstellen</h1>
+
+      <!-- Suchfeld -->
+      <label for="search">Vorlagen suchen</label>
+      <input id="search" type="search" placeholder="Tippe zum Filtern …" />
+
+      <!-- Vorlagen-Auswahl -->
+      <label for="template">Vorlage</label>
+      <select id="template" required>
+        <option value="" disabled selected>– Vorlage wählen –</option>
+      </select>
+      <div class="help">Vorlagen kommen aus deinem Google-Drive-Ordner.</div>
+
+      <!-- Dynamisch generierte Felder -->
+      <div id="dynamicFields"></div>
+
+      <!-- Aktionen -->
+      <button id="submitBtn" type="button">Dokument erzeugen</button>
+      <div id="msg" class="help"></div>
+      <div id="error" class="error" hidden></div>
+      <div id="result" class="success"></div>
+    </div>
+  </div>
+
+<script>
+/* ========= KONFIG ========= */
+const GAS_URL   = "https://script.google.com/macros/s/AKfycbz-Tuu-1R_T2cfM5jQlCz16PD3gP-OnD94nQ3OShEM1rSiRE5PYtZIEdK2wVtKBgneX/exec";
+const API_TOKEN = ""; // optional, meist leer lassen
+
+// Dropdown-Optionen je Placeholder (Option A)
+const FIELD_OPTIONS = {
+  "Beamtenverhältnis": ["auf Probe", "auf Widerruf", "auf Lebenszeit"],
+  "Dienstgrad": ["Polizeimeisteranwärter", "Polizeimeister", "Polizeiobermeister", "Polizeihauptmeister"],
+  "Abteilung": ["DirZA1", "DirZA2", "DirZA3", "DirZA4", "DirZA5"],
+  "Besoldungsgruppe": ["A6", "A7", "A8", "A9", "A10"],
+  "Geschlecht": ["weiblich", "männlich", "divers"],
+  "Anrede": ["Frau", "Herr", "Divers"]
+};
+
+// EXPLIZITE Date-Picker Felder
+const DATE_FIELDS = new Set([
+  "Datum",
+  "Entlassungsdatum"
+]);
+
+function isDateField(key) {
+  return DATE_FIELDS.has(key);
+}
+/* ========================= */
+
+const searchInput = document.getElementById('search');
+const templateSelect = document.getElementById('template');
+const dynamic = document.getElementById('dynamicFields');
+const btn = document.getElementById('submitBtn');
+const msg = document.getElementById('msg');
+const err = document.getElementById('error');
+const res = document.getElementById('result');
+
+let ALL_TEMPLATES = [];
+
+function showError(e){ err.hidden = false; err.textContent =
+  (e && e.message) ? e.message : (typeof e === 'string' ? e : 'Unbekannter Fehler'); }
+function clearStatus(){ err.hidden = true; err.textContent = '';
+  res.innerHTML = ''; msg.textContent = ''; }
+
+/* --- API helpers --- */
+async function apiGet(params) {
+  const url = new URL(GAS_URL);
+  Object.entries(params).forEach(([k,v]) => url.searchParams.set(k, v));
+  if (API_TOKEN) url.searchParams.set('token', API_TOKEN);
+  const r = await fetch(url.toString(), { method: "GET", mode: "cors" });
+  const j = await r.json();
+  if (j.error) throw j.error;
+  return j;
+}
+async function apiPost(action, payload) {
+  const body = new URLSearchParams();
+  body.set("action", action);
+  if (API_TOKEN) body.set("token", API_TOKEN);
+  body.set("payload", JSON.stringify(payload));
+  const r = await fetch(GAS_URL, {
+    method: "POST",
+    mode: "cors",
+    headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
+    body: body.toString()
+  });
+  const j = await r.json();
+  if (j.error) throw j.error;
+  return j;
+}
+
+/* --- Templates laden --- */
+(async () => {
+  try {
+    msg.innerHTML = 'Lade Vorlagen<span class="spinner"></span>';
+    const j = await apiGet({ action: "getTemplates" });
+    ALL_TEMPLATES = j.templates || [];
+    renderTemplateOptions(ALL_TEMPLATES);
+    msg.textContent = ALL_TEMPLATES.length ? 'Vorlagen geladen.' : 'Keine Vorlagen gefunden.';
+  } catch (e) { showError(e); }
+})();
+
+/* --- Select rendern --- */
+function renderTemplateOptions(items) {
+  templateSelect.innerHTML = '<option value="" disabled selected>– Vorlage wählen –</option>';
+  items.forEach(item => {
+    const opt = document.createElement('option');
+    opt.value = item.id;
+    opt.textContent = item.name;
+    templateSelect.appendChild(opt);
+  });
+}
+
+/* --- Live-Suche --- */
+searchInput.addEventListener('input', () => {
+  const q = searchInput.value.trim().toLowerCase();
+  const filtered = !q ? ALL_TEMPLATES : ALL_TEMPLATES.filter(t =>
+    t.name.toLowerCase().includes(q)
+  );
+  renderTemplateOptions(filtered);
+  dynamic.innerHTML = '';
+  res.innerHTML = '';
+  msg.textContent = filtered.length
+    ? (q ? `Gefunden: ${filtered.length}` : '')
+    : 'Keine Treffer.';
+});
+
+/* --- Vorlage geändert -> Platzhalter holen & Felder bauen --- */
+templateSelect.addEventListener('change', async () => {
+  clearStatus();
+  dynamic.innerHTML = ''; res.innerHTML = '';
+  const id = templateSelect.value;
+  if (!id) return;
+
+  try {
+    msg.innerHTML = 'Lese Platzhalter<span class="spinner"></span>';
+    const j = await apiGet({ action: "getPlaceholders", templateId: id });
+    const keys = j.placeholders || [];
+
+    const order = ['Vorname','Nachname','Datum','Entlassungsdatum'];
+    keys.sort((a,b)=> (order.indexOf(a)+1 || 999) - (order.indexOf(b)+1 || 999) || a.localeCompare(b,'de'));
+
+    keys.forEach(key => {
+      const fieldId = 'f_' + key.replace(/\s+/g,'_');
+      const label = document.createElement('label'); label.htmlFor = fieldId; label.textContent = key;
+
+      let input;
+      const opts = FIELD_OPTIONS[key];
+      if (opts && Array.isArray(opts) && opts.length) {
+        input = document.createElement('select');
+        const empty = document.createElement('option');
+        empty.value = ""; empty.textContent = "– bitte wählen –";
+        input.appendChild(empty);
+        opts.forEach(v => {
+          const o = document.createElement('option');
+          o.value = v; o.textContent = v;
+          input.appendChild(o);
+        });
+      } else if (isDateField(key)) {
+        input = document.createElement('input');
+        input.type = 'date';
+        input.valueAsDate = new Date();
+      } else {
+        input = document.createElement('input');
+        input.type = 'text';
+      }
+
+      input.id = fieldId; input.dataset.key = key; input.required = true;
+
+      if (/^(Vorname|Nachname)$/i.test(key)) {
+        let row = dynamic.querySelector('.grid-two');
+        if (!row) { row = document.createElement('div'); row.className = 'grid-two'; dynamic.appendChild(row); }
+        const wrap = document.createElement('div'); wrap.appendChild(label); wrap.appendChild(input); row.appendChild(wrap);
+      } else {
+        dynamic.appendChild(label); dynamic.appendChild(input);
+      }
+    });
+
+    msg.textContent = keys.length ? 'Platzhalter bereit.' : 'Keine {{…}}-Platzhalter in der Vorlage gefunden.';
+  } catch (e) { showError(e); }
+});
+
+/* --- Generieren (Multi-Dokument kompatibel) --- */
+btn.addEventListener('click', async () => {
+  clearStatus();
+  const templateId = templateSelect.value;
+  if (!templateId) return showError('Bitte Vorlage wählen.');
+
+  const fields = {};
+  dynamic.querySelectorAll('input, select').forEach(inp => {
+    const key = inp.dataset.key;
+    const val = (inp.tagName === 'INPUT' && inp.type === 'date' && inp.value)
+      ? new Date(inp.value).toLocaleDateString('de-DE')
+      : inp.value;
+    fields[key] = val ?? '';
+  });
+
+  btn.disabled = true;
+  msg.innerHTML = 'Erzeuge Dokument<span class="spinner"></span>';
+
+  try {
+    const r = await apiPost('generateDoc', { templateId, fields });
+    const items = (r && Array.isArray(r.results)) ? r.results : [r];
+
+    res.innerHTML = `
+      <p><strong>Fertig!</strong> Es wurden ${items.length} Dokument(e) erstellt:</p>
+      ${items.map(it => `
+        <div class="links" style="margin-bottom:8px">
+          <em>${it.fileName}</em><br>
+          <a href="${it.docUrl}" target="_blank" rel="noopener">Google&nbsp;Doc öffnen</a>
+          <a href="${it.pdfUrl}" target="_blank" rel="noopener" style="margin-left:12px">PDF öffnen</a>
+        </div>
+      `).join('')}
+    `;
+    msg.textContent = 'Erzeugung abgeschlossen.';
+  } catch (e) {
+    showError(e);
+  } finally {
+    btn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>
